@@ -1,21 +1,42 @@
-"""Model Router — routes LLM calls via LiteLLM with retry and fallback."""
+"""Model Router — routes LLM calls via CLI tools first, LiteLLM as fallback.
+
+Routing priority:
+1. CLI tools (claude, gemini) — zero config, uses existing subscriptions
+2. LiteLLM API — requires API keys in environment
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import litellm
 
+from musonius.orchestration.cli_backend import call_cli, detect_cli_tools
 from musonius.orchestration.usage import UsageTracker
 
 logger = logging.getLogger(__name__)
 
 # Suppress litellm's verbose logging
 litellm.suppress_debug_info = True
+
+# Map model provider prefixes to the CLI tool that handles them
+_PROVIDER_TO_CLI: dict[str, str] = {
+    "anthropic": "claude",
+    "gemini": "gemini",
+    "google": "gemini",
+}
+
+# Map model provider prefixes to the env var that holds the API key
+_PROVIDER_TO_KEY_ENV: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "google": "GEMINI_API_KEY",
+}
 
 
 @dataclass
@@ -40,10 +61,15 @@ class ModelResponse:
 
 
 class ModelRouter:
-    """Routes LLM calls via LiteLLM with retry logic, fallback, and usage tracking.
+    """Routes LLM calls with automatic backend selection.
 
-    Supports custom model definitions and API key resolution from config or
-    environment variables.
+    Priority order:
+    1. If API key exists for the model's provider → use LiteLLM (direct API)
+    2. If CLI tool exists for the model's provider → use CLI backend
+    3. Fallback model if configured
+
+    This means users with API keys get the full LiteLLM experience,
+    and users without keys can still use their CLI subscriptions.
 
     Args:
         config: Project configuration dictionary.
@@ -54,6 +80,13 @@ class ModelRouter:
         self.usage_tracker = UsageTracker()
         self._model_config = config.get("models", {})
         self._custom_models = self._build_custom_model_map()
+        self._cli_tools = detect_cli_tools()
+
+        if self._cli_tools:
+            logger.info(
+                "Detected CLI tools: %s",
+                ", ".join(self._cli_tools.keys()),
+            )
 
     def _build_custom_model_map(self) -> dict[str, dict[str, Any]]:
         """Build a lookup map from custom model definitions in config.
@@ -71,6 +104,55 @@ class ModelRouter:
                 continue
             result[name] = entry
         return result
+
+    def _get_provider(self, model: str) -> str:
+        """Extract the provider prefix from a model string.
+
+        Args:
+            model: Model identifier (e.g., "anthropic/claude-sonnet-4-20250514").
+
+        Returns:
+            Provider string (e.g., "anthropic"), or empty string.
+        """
+        if "/" in model:
+            return model.split("/")[0]
+        return ""
+
+    def _has_api_key(self, model: str) -> bool:
+        """Check if we should attempt a LiteLLM API call for this model.
+
+        For models with a known provider prefix (anthropic/, gemini/), checks
+        the corresponding environment variable. For unknown providers or models
+        without a prefix, returns True so LiteLLM can attempt its own key
+        resolution (e.g., OPENAI_API_KEY for gpt-4o).
+
+        Args:
+            model: Model identifier.
+
+        Returns:
+            True if we should attempt a LiteLLM call.
+        """
+        provider = self._get_provider(model)
+        env_var = _PROVIDER_TO_KEY_ENV.get(provider, "")
+        if env_var:
+            return bool(os.environ.get(env_var))
+        # Unknown provider — let LiteLLM try (it may resolve the key itself)
+        return True
+
+    def _get_cli_tool_for_model(self, model: str) -> str | None:
+        """Get the CLI tool name that can handle this model, if available.
+
+        Args:
+            model: Model identifier.
+
+        Returns:
+            CLI tool name ("claude" or "gemini"), or None if unavailable.
+        """
+        provider = self._get_provider(model)
+        cli_name = _PROVIDER_TO_CLI.get(provider)
+        if cli_name and cli_name in self._cli_tools:
+            return cli_name
+        return None
 
     def resolve_model(self, model: str) -> tuple[str, dict[str, Any]]:
         """Resolve a model name to a LiteLLM-compatible identifier and extra kwargs.
@@ -132,7 +214,12 @@ class ModelRouter:
         fallback_model: str | None = None,
         **kwargs: Any,
     ) -> ModelResponse:
-        """Call an LLM via LiteLLM with retry and fallback support.
+        """Call an LLM with automatic backend selection.
+
+        Tries in order:
+        1. LiteLLM (if API key exists for the provider)
+        2. CLI backend (if CLI tool is installed)
+        3. Fallback model (if configured)
 
         Args:
             model: Model identifier (e.g., "anthropic/claude-sonnet-4-20250514").
@@ -151,34 +238,59 @@ class ModelRouter:
         """
         last_error: Exception | None = None
 
-        for attempt in range(retries + 1):
+        # Strategy 1: Try LiteLLM if we have an API key
+        if self._has_api_key(model):
+            for attempt in range(retries + 1):
+                try:
+                    return self._make_litellm_call(model, messages, temperature, max_tokens, **kwargs)
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "LiteLLM call failed (attempt %d/%d) for %s: %s",
+                        attempt + 1,
+                        retries + 1,
+                        model,
+                        e,
+                    )
+                    if attempt < retries:
+                        base_delay = 2**attempt
+                        jitter = random.uniform(0, base_delay * 0.5)
+                        time.sleep(base_delay + jitter)
+
+        # Strategy 2: Try CLI backend
+        cli_tool = self._get_cli_tool_for_model(model)
+        if cli_tool:
             try:
-                return self._make_call(model, messages, temperature, max_tokens, **kwargs)
+                return self._make_cli_call(cli_tool, model, messages, max_tokens)
             except Exception as e:
                 last_error = e
-                logger.warning(
-                    "Model call failed (attempt %d/%d) for %s: %s",
-                    attempt + 1,
-                    retries + 1,
-                    model,
-                    e,
-                )
-                if attempt < retries:
-                    time.sleep(2**attempt)
+                logger.warning("CLI call failed for %s via %s: %s", model, cli_tool, e)
 
-        # Try fallback model
+        # Strategy 3: Try fallback model (recurse with fallback)
         if fallback_model and fallback_model != model:
-            logger.info("Falling back to %s", fallback_model)
+            logger.info("Falling back from %s to %s", model, fallback_model)
             try:
-                return self._make_call(
-                    fallback_model, messages, temperature, max_tokens, **kwargs
+                return self.call(
+                    fallback_model, messages, temperature, max_tokens,
+                    retries=retries, fallback_model=None, **kwargs,
                 )
             except Exception as e:
                 logger.error("Fallback model %s also failed: %s", fallback_model, e)
+                last_error = e
 
-        raise RuntimeError(
-            f"All model call attempts failed for {model}: {last_error}"
-        ) from last_error
+        # Build helpful error message
+        error_parts = [f"All model call attempts failed for {model}."]
+        if not self._has_api_key(model):
+            provider = self._get_provider(model)
+            env_var = _PROVIDER_TO_KEY_ENV.get(provider, f"{provider.upper()}_API_KEY")
+            error_parts.append(f"No API key found (set {env_var}).")
+        if not cli_tool:
+            provider = self._get_provider(model)
+            cli_name = _PROVIDER_TO_CLI.get(provider, "unknown")
+            error_parts.append(f"No '{cli_name}' CLI found in PATH.")
+        error_parts.append("Install a CLI tool or set an API key.")
+
+        raise RuntimeError(" ".join(error_parts)) from last_error
 
     def call_scout(
         self, messages: list[dict[str, str]], **kwargs: Any
@@ -209,7 +321,9 @@ class ModelRouter:
             ModelResponse from the planner model.
         """
         model = self.get_model("planner")
-        return self.call(model, messages, **kwargs)
+        # If planner is anthropic and no key, try gemini as fallback
+        fallback = self.get_model("scout")
+        return self.call(model, messages, fallback_model=fallback, **kwargs)
 
     def call_verifier(
         self, messages: list[dict[str, str]], **kwargs: Any
@@ -226,7 +340,52 @@ class ModelRouter:
         model = self.get_model("verifier")
         return self.call(model, messages, **kwargs)
 
-    def _make_call(
+    def _make_cli_call(
+        self,
+        cli_tool: str,
+        model: str,
+        messages: list[dict[str, str]],
+        max_tokens: int | None = None,
+    ) -> ModelResponse:
+        """Make an LLM call via a CLI tool.
+
+        Args:
+            cli_tool: CLI tool name ("claude" or "gemini").
+            model: Original model identifier (for tracking).
+            messages: Chat messages.
+            max_tokens: Maximum response tokens.
+
+        Returns:
+            ModelResponse from the CLI tool.
+        """
+        logger.info("Routing %s via %s CLI", model, cli_tool)
+        result = call_cli(cli_tool, messages, max_tokens=max_tokens)
+
+        content = result["content"]
+        latency_ms = result.get("latency_ms", 0.0)
+
+        # Rough token estimation for CLI calls (no exact count available)
+        prompt_text = " ".join(m.get("content", "") for m in messages)
+        est_prompt_tokens = len(prompt_text) // 4
+        est_completion_tokens = len(content) // 4
+
+        self.usage_tracker.record(
+            model=f"{cli_tool}-cli",
+            prompt_tokens=est_prompt_tokens,
+            completion_tokens=est_completion_tokens,
+            cost=0.0,  # CLI uses existing subscription
+        )
+
+        return ModelResponse(
+            content=content,
+            model=f"{cli_tool}-cli",
+            prompt_tokens=est_prompt_tokens,
+            completion_tokens=est_completion_tokens,
+            cost=0.0,
+            latency_ms=latency_ms,
+        )
+
+    def _make_litellm_call(
         self,
         model: str,
         messages: list[dict[str, str]],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,13 @@ import pytest
 
 from musonius.orchestration.router import ModelResponse, ModelRouter
 from musonius.orchestration.usage import UsageTracker
+
+# Fake API keys so the router uses LiteLLM path in tests
+_FAKE_ENV = {
+    "ANTHROPIC_API_KEY": "sk-test-fake",
+    "GEMINI_API_KEY": "test-gemini-key",
+    "OPENAI_API_KEY": "sk-test-openai",
+}
 
 
 def _make_litellm_response(
@@ -277,11 +285,12 @@ class TestResolveModel:
 # ---------------------------------------------------------------------------
 
 
+@patch("musonius.orchestration.router.detect_cli_tools", return_value={})
 class TestModelRouterCall:
     """Tests for ModelRouter.call with mocked LiteLLM."""
 
     @patch("musonius.orchestration.router.litellm")
-    def test_successful_call(self, mock_litellm: MagicMock) -> None:
+    def test_successful_call(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should return ModelResponse on success."""
         mock_litellm.completion.return_value = _make_litellm_response("Hi there")
         mock_litellm.completion_cost.return_value = 0.001
@@ -301,7 +310,7 @@ class TestModelRouterCall:
         assert router.usage_tracker.total_tokens == 15
 
     @patch("musonius.orchestration.router.litellm")
-    def test_retry_on_failure(self, mock_litellm: MagicMock) -> None:
+    def test_retry_on_failure(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should retry and succeed on second attempt."""
         mock_litellm.completion.side_effect = [
             Exception("API error"),
@@ -320,7 +329,7 @@ class TestModelRouterCall:
         assert mock_litellm.completion.call_count == 2
 
     @patch("musonius.orchestration.router.litellm")
-    def test_fallback_on_all_retries_exhausted(self, mock_litellm: MagicMock) -> None:
+    def test_fallback_on_all_retries_exhausted(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should use fallback model when primary exhausts retries."""
         mock_litellm.completion.side_effect = [
             Exception("Fail 1"),
@@ -340,7 +349,7 @@ class TestModelRouterCall:
         assert resp.content == "Fallback response"
 
     @patch("musonius.orchestration.router.litellm")
-    def test_raises_when_all_fail(self, mock_litellm: MagicMock) -> None:
+    def test_raises_when_all_fail(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should raise RuntimeError when all attempts and fallback fail."""
         mock_litellm.completion.side_effect = Exception("All broken")
 
@@ -353,7 +362,7 @@ class TestModelRouterCall:
             )
 
     @patch("musonius.orchestration.router.litellm")
-    def test_raises_when_fallback_also_fails(self, mock_litellm: MagicMock) -> None:
+    def test_raises_when_fallback_also_fails(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should raise RuntimeError when both primary and fallback fail."""
         mock_litellm.completion.side_effect = Exception("All broken")
 
@@ -367,7 +376,7 @@ class TestModelRouterCall:
             )
 
     @patch("musonius.orchestration.router.litellm")
-    def test_cost_fallback_on_error(self, mock_litellm: MagicMock) -> None:
+    def test_cost_fallback_on_error(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should default cost to 0.0 when completion_cost raises."""
         mock_litellm.completion.return_value = _make_litellm_response()
         mock_litellm.completion_cost.side_effect = Exception("Unknown model")
@@ -381,7 +390,7 @@ class TestModelRouterCall:
         assert resp.cost == 0.0
 
     @patch("musonius.orchestration.router.litellm")
-    def test_custom_model_kwargs_injected(self, mock_litellm: MagicMock) -> None:
+    def test_custom_model_kwargs_injected(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should inject api_base from custom model config into litellm call."""
         mock_litellm.completion.return_value = _make_litellm_response()
         mock_litellm.completion_cost.return_value = 0.0
@@ -416,11 +425,13 @@ class TestModelRouterCall:
 # ---------------------------------------------------------------------------
 
 
+@patch.dict("os.environ", _FAKE_ENV)
+@patch("musonius.orchestration.router.detect_cli_tools", return_value={})
 class TestModelRouterRoleMethods:
     """Tests for call_scout, call_planner, call_verifier."""
 
     @patch("musonius.orchestration.router.litellm")
-    def test_call_scout(self, mock_litellm: MagicMock) -> None:
+    def test_call_scout(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should use configured scout model."""
         mock_litellm.completion.return_value = _make_litellm_response("Scout reply")
         mock_litellm.completion_cost.return_value = 0.0
@@ -435,7 +446,7 @@ class TestModelRouterRoleMethods:
         assert all_kwargs["model"] == "gemini/gemini-2.0-flash"
 
     @patch("musonius.orchestration.router.litellm")
-    def test_call_planner(self, mock_litellm: MagicMock) -> None:
+    def test_call_planner(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should use configured planner model."""
         mock_litellm.completion.return_value = _make_litellm_response("Plan")
         mock_litellm.completion_cost.return_value = 0.0
@@ -447,7 +458,7 @@ class TestModelRouterRoleMethods:
         assert resp.content == "Plan"
 
     @patch("musonius.orchestration.router.litellm")
-    def test_call_verifier(self, mock_litellm: MagicMock) -> None:
+    def test_call_verifier(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should use configured verifier model."""
         mock_litellm.completion.return_value = _make_litellm_response("Verified")
         mock_litellm.completion_cost.return_value = 0.0
@@ -459,7 +470,7 @@ class TestModelRouterRoleMethods:
         assert resp.content == "Verified"
 
     @patch("musonius.orchestration.router.litellm")
-    def test_scout_falls_back_to_summarizer(self, mock_litellm: MagicMock) -> None:
+    def test_scout_falls_back_to_summarizer(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Scout should use summarizer as fallback model."""
         mock_litellm.completion.side_effect = [
             Exception("Scout down"),
@@ -481,11 +492,13 @@ class TestModelRouterRoleMethods:
 # ---------------------------------------------------------------------------
 
 
+@patch.dict("os.environ", _FAKE_ENV)
+@patch("musonius.orchestration.router.detect_cli_tools", return_value={})
 class TestModelRouterUsageTracking:
     """Tests for usage tracking across model calls."""
 
     @patch("musonius.orchestration.router.litellm")
-    def test_tracks_usage_across_calls(self, mock_litellm: MagicMock) -> None:
+    def test_tracks_usage_across_calls(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Usage tracker should accumulate across multiple calls."""
         mock_litellm.completion.return_value = _make_litellm_response(
             prompt_tokens=100, completion_tokens=50
@@ -501,7 +514,7 @@ class TestModelRouterUsageTracking:
         assert router.usage_tracker.total_cost == pytest.approx(0.02)
 
     @patch("musonius.orchestration.router.litellm")
-    def test_usage_report(self, mock_litellm: MagicMock) -> None:
+    def test_usage_report(self, mock_litellm: MagicMock, _mock_cli: MagicMock) -> None:
         """Should generate a readable usage report."""
         mock_litellm.completion.return_value = _make_litellm_response(
             prompt_tokens=500, completion_tokens=100

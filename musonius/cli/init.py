@@ -88,6 +88,7 @@ def init_command(
 
         # Initialize memory store
         task = progress.add_task("Initializing memory store...", total=None)
+        store = None
         try:
             from musonius.memory.store import MemoryStore
 
@@ -98,10 +99,49 @@ def init_command(
             logger.warning("Memory initialization failed: %s", e)
             progress.update(task, description=f"[yellow]Memory skipped:[/yellow] {e}")
 
+        # Detect coding conventions
+        convention_count = 0
+        task = progress.add_task("Detecting coding conventions...", total=None)
+        try:
+            from musonius.memory.convention_detector import (
+                detect_conventions,
+                store_conventions,
+            )
+
+            report = detect_conventions(
+                project_root,
+                graph=graph if "graph" in dir() else None,
+            )
+            if store is not None:
+                convention_count = store_conventions(report, store)
+            progress.update(
+                task,
+                description=f"Detected {len(report.conventions)} conventions"
+                f" ({convention_count} stored).",
+            )
+        except Exception as e:
+            logger.warning("Convention detection failed: %s", e)
+            progress.update(
+                task, description=f"[yellow]Convention detection skipped:[/yellow] {e}"
+            )
+
+    # Log activity
+    try:
+        from musonius.memory.activity import track_activity
+
+        with track_activity(project_root, "init") as activity:
+            activity["outcome"] = (
+                f"Indexed {file_count} files, {symbol_count} symbols, "
+                f"{convention_count} conventions"
+            )
+    except Exception:
+        pass  # Activity tracking is non-critical
+
     console.print()
     console.print(f"[green]Musonius initialized[/green] at {project_root}")
     console.print(f"  Files indexed: {file_count}")
     console.print(f"  Symbols found: {symbol_count}")
+    console.print(f"  Conventions detected: {convention_count}")
     console.print()
     console.print("Next steps:")
     console.print("  [bold]musonius plan \"your task\"[/bold]  — Generate a plan")

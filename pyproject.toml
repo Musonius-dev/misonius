@@ -74,6 +74,10 @@ known-first-party = ["musonius"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+filterwarnings = [
+    "ignore::DeprecationWarning:litellm",
+    "ignore::DeprecationWarning:asyncio",
+]
 
 [tool.mypy]
 python_version = "3.12"

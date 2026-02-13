@@ -4,7 +4,7 @@ from __future__ import annotations
 
 PLAN_SYSTEM_PROMPT = """\
 You are a technical planning assistant for software engineering tasks.
-Generate detailed, file-level implementation plans.
+Generate detailed, file-level implementation plans with architectural decisions.
 
 Output ONLY valid JSON matching this schema:
 {
@@ -24,6 +24,14 @@ Output ONLY valid JSON matching this schema:
       "acceptance_criteria": ["criterion 1", "criterion 2"],
       "test_strategy": "How to test this phase"
     }
+  ],
+  "architecture_decisions": [
+    {
+      "summary": "Short description of the decision",
+      "rationale": "Why this approach was chosen",
+      "category": "architecture|dependency|pattern|api|security|performance",
+      "files_affected": ["path/to/file.py"]
+    }
   ]
 }
 
@@ -32,6 +40,9 @@ Rules:
 - Each phase should be independently testable
 - Acceptance criteria must be concrete and verifiable
 - Include a test strategy for each phase
+- Extract ALL architectural decisions made during planning
+- Categories: architecture (structure), dependency (libraries), pattern (code patterns),
+  api (API contracts), security (auth, encryption), performance (optimization)
 """
 
 PLAN_USER_TEMPLATE = """\

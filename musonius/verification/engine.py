@@ -266,6 +266,7 @@ class VerificationEngine:
         # Store patterns in memory
         if self._memory:
             self._store_verification_patterns(result)
+            self._record_verification_outcome(result)
 
         return result
 
@@ -720,10 +721,11 @@ class VerificationEngine:
             logger.debug("Failed to store verification patterns: %s", e)
 
     def _learn_from_failures(self, result: VerificationResult) -> None:
-        """Update memory with failed approaches from critical findings.
+        """Update memory with failed approaches from critical and major findings.
 
-        If critical findings are detected, stores what was attempted,
-        why it failed, and what should be done instead.
+        Stores what was attempted, why it failed, and what should be done
+        instead. Records both critical and major findings to build a
+        comprehensive anti-pattern library.
 
         Args:
             result: The completed verification result.
@@ -731,15 +733,16 @@ class VerificationEngine:
         if not self._memory:
             return
 
-        critical_findings = [
-            f for f in result.findings if f.severity == Severity.CRITICAL
+        significant_findings = [
+            f for f in result.findings
+            if f.severity in (Severity.CRITICAL, Severity.MAJOR)
         ]
-        if not critical_findings:
+        if not significant_findings:
             return
 
-        for finding in critical_findings:
+        for finding in significant_findings:
             approach = f"Implementation in {finding.file_path or 'unknown'}: {finding.message}"
-            reason = f"Category: {finding.category}. {finding.plan_reference}"
+            reason = f"Category: {finding.category}. {finding.plan_reference or ''}"
             alternative = finding.suggestion
 
             try:
@@ -752,3 +755,47 @@ class VerificationEngine:
                 )
             except Exception as e:
                 logger.debug("Failed to record failure: %s", e)
+
+    def _record_verification_outcome(self, result: VerificationResult) -> None:
+        """Record the overall verification outcome as a decision in memory.
+
+        This creates a persistent record of what was verified, whether it
+        passed, and what the key findings were — so future plans can
+        reference past verification results.
+
+        Args:
+            result: The completed verification result.
+        """
+        if not self._memory:
+            return
+
+        try:
+            status = "PASSED" if result.passed else "FAILED"
+            summary = f"Verification {status}"
+            if result.epic_id:
+                summary += f" for {result.epic_id}"
+            if result.phase_id:
+                summary += f" phase-{result.phase_id}"
+
+            details = []
+            if result.critical_count:
+                details.append(f"{result.critical_count} critical")
+            if result.major_count:
+                details.append(f"{result.major_count} major")
+            if result.minor_count:
+                details.append(f"{result.minor_count} minor")
+
+            rationale = f"Findings: {', '.join(details)}" if details else "Clean verification"
+            if result.files_changed:
+                rationale += f". Files: {', '.join(result.files_changed[:5])}"
+
+            self._memory.add_decision(
+                summary=summary,
+                rationale=rationale,
+                category="verification",
+                epic_id=result.epic_id or None,
+                files_affected=result.files_changed[:10] if result.files_changed else None,
+                confidence=1.0,
+            )
+        except Exception as e:
+            logger.debug("Failed to record verification outcome: %s", e)

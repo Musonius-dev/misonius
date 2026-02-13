@@ -58,51 +58,60 @@ def plan_command(
         refined_task = _run_clarification(task, router)
 
     # Generate plan with repo map context
-    try:
-        from musonius.config.defaults import INDEX_DIR
-        from musonius.context.indexer import Indexer
-        from musonius.context.repo_map import RepoMapGenerator
-        from musonius.planning.engine import PlanningEngine
+    from musonius.memory.activity import track_activity
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            # Load repo map from index cache
-            repo_map = ""
-            map_task = progress.add_task("Loading repo map...", total=None)
-            try:
-                indexer = Indexer(project_root)
-                cache_dir = project_root / ".musonius" / INDEX_DIR
-                cached_graph = indexer.load_cache(cache_dir)
-                if cached_graph:
-                    repo_map_gen = RepoMapGenerator(indexer)
-                    repo_map = repo_map_gen.generate(level=1, token_budget=4000)
-                    progress.update(
-                        map_task,
-                        description=f"Loaded repo map ({len(repo_map):,} chars).",
-                    )
-                else:
-                    progress.update(
-                        map_task,
-                        description="No index cache found, planning without repo map.",
-                    )
-            except Exception as e:
-                logger.debug("Failed to load repo map: %s", e)
-                progress.update(map_task, description="Repo map unavailable.")
+    with track_activity(project_root, "plan", args=task) as activity:
+        try:
+            from musonius.config.defaults import INDEX_DIR
+            from musonius.context.indexer import Indexer
+            from musonius.context.repo_map import RepoMapGenerator
+            from musonius.planning.engine import PlanningEngine
 
-            # Generate the plan via LLM
-            gen_task = progress.add_task("Generating plan...", total=None)
-            engine = PlanningEngine(memory=memory, router=router, project_root=project_root)
-            plan = engine.generate_plan(refined_task, max_phases=phases, repo_map=repo_map)
-            progress.update(gen_task, description="Plan generated.")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                # Load repo map from index cache
+                repo_map = ""
+                map_task = progress.add_task("Loading repo map...", total=None)
+                try:
+                    indexer = Indexer(project_root)
+                    cache_dir = project_root / ".musonius" / INDEX_DIR
+                    cached_graph = indexer.load_cache(cache_dir)
+                    if cached_graph:
+                        repo_map_gen = RepoMapGenerator(indexer)
+                        repo_map = repo_map_gen.generate(level=1, token_budget=4000)
+                        progress.update(
+                            map_task,
+                            description=f"Loaded repo map ({len(repo_map):,} chars).",
+                        )
+                    else:
+                        progress.update(
+                            map_task,
+                            description="No index cache found, planning without repo map.",
+                        )
+                except Exception as e:
+                    logger.debug("Failed to load repo map: %s", e)
+                    progress.update(map_task, description="Repo map unavailable.")
 
-        _display_plan(plan)
-    except Exception as e:
-        logger.exception("Plan generation failed")
-        console.print(f"[red]Plan generation failed:[/red] {e}")
-        console.print("[dim]Tip: Ensure your LLM API keys are configured.[/dim]")
+                # Generate the plan via LLM
+                gen_task = progress.add_task("Generating plan...", total=None)
+                engine = PlanningEngine(memory=memory, router=router, project_root=project_root)
+                plan = engine.generate_plan(refined_task, max_phases=phases, repo_map=repo_map)
+                progress.update(gen_task, description="Plan generated.")
+
+            # Track epic lifecycle
+            memory.set_epic_status(plan.epic_id, "planned", task_description=refined_task)
+            activity["epic_id"] = plan.epic_id
+            activity["outcome"] = f"Generated {len(plan.phases)} phases as {plan.epic_id}"
+
+            _display_plan(plan)
+        except Exception as e:
+            logger.exception("Plan generation failed")
+            activity["outcome"] = f"Failed: {e}"
+            console.print(f"[red]Plan generation failed:[/red] {e}")
+            console.print("[dim]Tip: Ensure your LLM API keys are configured.[/dim]")
 
 
 def _run_clarification(task: str, router: ModelRouter) -> str:
@@ -151,6 +160,18 @@ def _run_clarification(task: str, router: ModelRouter) -> str:
     if not answers:
         console.print("[dim]No answers provided, proceeding with original task.[/dim]\n")
         return task
+
+    # Persist clarification Q&A for session context
+    try:
+        from musonius.cli.utils import find_project_root
+        from musonius.memory.activity import save_clarification
+
+        project_root = find_project_root()
+        for q in questions:
+            if q.id in answers:
+                save_clarification(project_root, q.question, answers[q.id])
+    except Exception:
+        pass  # Clarification saving is non-critical
 
     # Refine the intent
     refined = intent_engine.refine_intent(intent, answers, questions)

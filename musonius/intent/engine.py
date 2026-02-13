@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from musonius.orchestration.router import ModelRouter
 
@@ -49,7 +49,7 @@ class Intent:
     edge_cases: list[str] = field(default_factory=list)
     success_criteria: list[str] = field(default_factory=list)
     clarification_history: list[tuple[Question, str]] = field(default_factory=list)
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def is_refined(self) -> bool:

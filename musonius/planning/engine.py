@@ -86,7 +86,20 @@ class PlanningEngine:
 
         response = self.router.call_planner(messages)
 
+        raw_data = self._extract_json(response.content)
         plan = self._parse_plan_response(response.content, task_description)
+
+        # Validate plan and log warnings
+        validation_errors = self.validate_plan(plan)
+        for error in validation_errors:
+            logger.warning("Plan validation: %s", error)
+
+        # Extract and store architectural decisions from plan output
+        self._extract_and_store_decisions(raw_data, plan.epic_id)
+
+        # Generate SOT files from decisions
+        self._generate_sot_files(raw_data, plan.epic_id)
+
         self._save_plan(plan)
 
         return plan
@@ -224,6 +237,130 @@ class PlanningEngine:
             phase_path.write_text(content)
 
         logger.info("Saved plan %s with %d phases to %s", plan.epic_id, len(plan.phases), epics_dir)
+
+    def _extract_and_store_decisions(
+        self, raw_data: dict[str, Any], epic_id: str
+    ) -> int:
+        """Extract architectural decisions from plan output and store in memory.
+
+        Args:
+            raw_data: Raw parsed JSON from LLM response.
+            epic_id: Epic ID to associate decisions with.
+
+        Returns:
+            Number of decisions stored.
+        """
+        decisions = raw_data.get("architecture_decisions", [])
+        stored = 0
+
+        for decision in decisions:
+            if not isinstance(decision, dict):
+                continue
+
+            summary = decision.get("summary", "")
+            if not summary:
+                continue
+
+            try:
+                self.memory.add_decision(
+                    summary=summary,
+                    rationale=decision.get("rationale", ""),
+                    category=decision.get("category", "architecture"),
+                    epic_id=epic_id,
+                    files_affected=decision.get("files_affected"),
+                    confidence=0.85,
+                )
+                stored += 1
+            except Exception as e:
+                logger.debug("Failed to store decision '%s': %s", summary, e)
+
+        if stored:
+            logger.info("Stored %d architectural decisions from plan %s", stored, epic_id)
+
+        return stored
+
+    def _generate_sot_files(
+        self, raw_data: dict[str, Any], epic_id: str
+    ) -> list[Path]:
+        """Generate Source of Truth files from architectural decisions.
+
+        Creates versioned markdown files in .musonius/sot/ like TECH-001.md,
+        API-001.md, etc. based on decision categories.
+
+        Args:
+            raw_data: Raw parsed JSON from LLM response.
+            epic_id: Epic ID for traceability.
+
+        Returns:
+            List of paths to created SOT files.
+        """
+        decisions = raw_data.get("architecture_decisions", [])
+        if not decisions:
+            return []
+
+        sot_dir = self.project_root / ".musonius" / "sot"
+        sot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Category to SOT prefix mapping
+        category_prefix = {
+            "architecture": "ARCH",
+            "dependency": "DEP",
+            "pattern": "CONV",
+            "api": "API",
+            "security": "SEC",
+            "performance": "PERF",
+            "general": "TECH",
+        }
+
+        created_files: list[Path] = []
+
+        for decision in decisions:
+            if not isinstance(decision, dict) or not decision.get("summary"):
+                continue
+
+            category = decision.get("category", "general")
+            prefix = category_prefix.get(category, "TECH")
+
+            # Find next available ID for this prefix
+            existing = sorted(sot_dir.glob(f"{prefix}-*.md"))
+            if existing:
+                last_num = 0
+                for f in existing:
+                    try:
+                        num = int(f.stem.split("-")[1])
+                        last_num = max(last_num, num)
+                    except (IndexError, ValueError):
+                        pass
+                next_num = last_num + 1
+            else:
+                next_num = 1
+
+            sot_id = f"{prefix}-{next_num:03d}"
+            sot_path = sot_dir / f"{sot_id}.md"
+
+            # Build SOT content
+            content = f"# {sot_id}: {decision.get('summary', 'Untitled')}\n\n"
+            content += f"**Category:** {category}\n"
+            content += f"**Epic:** {epic_id}\n"
+            content += f"**Status:** Active\n\n"
+
+            if decision.get("rationale"):
+                content += f"## Rationale\n\n{decision['rationale']}\n\n"
+
+            if decision.get("files_affected"):
+                content += "## Files Affected\n\n"
+                for f_path in decision["files_affected"]:
+                    content += f"- `{f_path}`\n"
+                content += "\n"
+
+            content += "## History\n\n"
+            content += f"- Created during planning of {epic_id}\n"
+
+            sot_path.write_text(content)
+            created_files.append(sot_path)
+            logger.info("Created SOT file: %s", sot_id)
+
+        return created_files
 
     def validate_plan(self, plan: Plan) -> list[str]:
         """Validate a plan for completeness and correctness.

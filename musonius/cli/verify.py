@@ -73,26 +73,42 @@ def verify_command(
     except Exception as e:
         logger.debug("Memory setup failed: %s", e)
 
+    from musonius.memory.activity import track_activity
     from musonius.verification.engine import VerificationEngine
 
-    engine = VerificationEngine(
-        router=router,
-        memory=memory,
-        repo_path=project_root,
-    )
+    with track_activity(project_root, "verify", args=f"epic={epic or 'latest'}") as activity:
+        engine = VerificationEngine(
+            router=router,
+            memory=memory,
+            repo_path=project_root,
+        )
 
-    base = against or "HEAD"
-    verification = engine.verify(
-        epic_id=epic or "",
-        phase_id=phase or "",
-        base=base,
-        staged=staged,
-        auto_fix=fix,
-        use_llm=not no_llm,
-        plan=plan,
-    )
+        base = against or "HEAD"
+        verification = engine.verify(
+            epic_id=epic or "",
+            phase_id=phase or "",
+            base=base,
+            staged=staged,
+            auto_fix=fix,
+            use_llm=not no_llm,
+            plan=plan,
+        )
 
-    _display_findings(verification, allowed_severities)
+        # Update epic lifecycle status
+        if memory and epic:
+            if verification.passed:
+                memory.set_epic_status(epic, "verified")
+            else:
+                memory.set_epic_status(epic, "in_progress")
+
+        activity["epic_id"] = epic
+        status = "PASSED" if verification.passed else "FAILED"
+        activity["outcome"] = (
+            f"{status}: {verification.critical_count} critical, "
+            f"{verification.major_count} major, {verification.minor_count} minor"
+        )
+
+        _display_findings(verification, allowed_severities)
 
     if memory:
         memory.close()
