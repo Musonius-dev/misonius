@@ -6,7 +6,10 @@ PLAN_SYSTEM_PROMPT = """\
 You are a technical planning assistant for software engineering tasks.
 Generate detailed, file-level implementation plans with architectural decisions.
 
-Output ONLY valid JSON matching this schema:
+CRITICAL: Your response must be ONLY a valid JSON object. No explanation text before or after.
+No markdown formatting. No conversational preamble. Just the raw JSON object.
+
+Output valid JSON matching this schema:
 {
   "phases": [
     {
@@ -65,6 +68,8 @@ PLAN_USER_TEMPLATE = """\
 Generate a file-level implementation plan with {max_phases} phase(s).
 For each file, describe the key changes needed.
 Include acceptance criteria and test strategy.
+
+IMPORTANT: Respond with ONLY the JSON object. No text before or after it.
 """
 
 

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from musonius.cli.display import PipelineProgress, _StepHandle, render_plan_markdown
 from musonius.cli.utils import console, handle_errors
 
 logger = logging.getLogger(__name__)
@@ -36,34 +37,30 @@ def go_command(
         musonius_dir = project_root / ".musonius"
         already_initialized = musonius_dir.is_dir() and (musonius_dir / "config.yaml").exists()
 
-        plan = None
-        handoff_path = None
+        plan: Any = None
+        handoff_path: str | None = None
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            # Step 1: Init (skip if already done and --skip-init or auto-detected)
+        with PipelineProgress() as pipeline:
+            # Step 1: Init
             if already_initialized and skip_init:
-                progress.add_task("[dim]Already initialized — skipping init.[/dim]", total=1)
+                with pipeline.step("Initialize") as step:
+                    step.detail("Already initialized — skipped")
             elif already_initialized:
-                init_task = progress.add_task("Re-indexing codebase...", total=None)
-                _run_init(project_root, progress, init_task, reindex=True)
+                with pipeline.step("Re-index codebase") as step:
+                    _run_init_pipeline(project_root, step, reindex=True)
             else:
-                init_task = progress.add_task("Initializing project...", total=None)
-                _run_init(project_root, progress, init_task, reindex=False)
+                with pipeline.step("Initialize project") as step:
+                    _run_init_pipeline(project_root, step, reindex=False)
 
             # Step 2: Plan
-            plan_task = progress.add_task("Generating plan...", total=None)
-            plan = _run_plan(project_root, task, phases, progress, plan_task)
-
-            if not plan:
-                console.print("[red]Plan generation failed. Falling back to prep-only mode.[/red]")
+            with pipeline.step("Generate plan") as step:
+                plan = _run_plan_pipeline(project_root, task, phases, step)
+                if not plan:
+                    step.detail("Failed — falling back to prep-only")
 
             # Step 3: Prep
-            prep_task = progress.add_task("Generating handoff...", total=None)
-            handoff_path = _run_prep(project_root, agent, output, progress, prep_task)
+            with pipeline.step("Generate handoff") as step:
+                handoff_path = _run_prep_pipeline(project_root, agent, output, step)
 
         # Track epic and outcome
         if plan:
@@ -72,7 +69,7 @@ def go_command(
             if isinstance(plan, Plan):
                 activity["epic_id"] = plan.epic_id
 
-        parts = []
+        parts: list[str] = []
         if plan:
             from musonius.planning.schemas import Plan as PlanSchema
 
@@ -82,15 +79,21 @@ def go_command(
             parts.append(f"handoff={handoff_path}")
         activity["outcome"] = "go complete: " + ", ".join(parts) if parts else "go complete"
 
-        # Display results
+        # Display results with enhanced rendering
         console.print()
         if plan:
-            from musonius.planning.schemas import Plan
+            try:
+                render_plan_markdown(plan)
+            except Exception:
+                from musonius.planning.schemas import Plan
 
-            if isinstance(plan, Plan):
-                console.print(f"[bold green]Plan:[/bold green] {plan.epic_id} ({len(plan.phases)} phases)")
-                for phase in plan.phases:
-                    console.print(f"  Phase: {phase.title} ({len(phase.files)} files)")
+                if isinstance(plan, Plan):
+                    console.print(
+                        f"[bold green]Plan:[/bold green] {plan.epic_id} "
+                        f"({len(plan.phases)} phases)"
+                    )
+                    for phase in plan.phases:
+                        console.print(f"  Phase: {phase.title} ({len(phase.files)} files)")
 
         if handoff_path and Path(handoff_path).exists():
             size = Path(handoff_path).stat().st_size
@@ -100,13 +103,12 @@ def go_command(
             console.print("[yellow]Handoff file was not generated.[/yellow]")
 
 
-def _run_init(
+def _run_init_pipeline(
     project_root: Path,
-    progress: Progress,
-    task_id: object,
+    step: _StepHandle,
     reindex: bool = False,
 ) -> None:
-    """Run the init step."""
+    """Run the init step with pipeline progress tracking."""
     try:
         from musonius.config.defaults import INDEX_DIR
         from musonius.config.loader import load_config, save_config
@@ -117,53 +119,55 @@ def _run_init(
         musonius_dir = project_root / ".musonius"
 
         if not musonius_dir.exists():
-            # Create scaffold
             for subdir in ["index", "memory", "epics", "sot"]:
                 (musonius_dir / subdir).mkdir(parents=True, exist_ok=True)
-
             config = load_config(project_root)
-            save_config(config, musonius_dir / "config.yaml")
+            save_config(project_root, config)
 
-        # Set up memory
         db_path = musonius_dir / "memory" / "decisions.db"
         store = MemoryStore(db_path)
         store.initialize()
 
-        # Index codebase
+        step.detail("Indexing files...")
         indexer = Indexer(project_root)
         graph = indexer.index_codebase()
         cache_dir = musonius_dir / INDEX_DIR
         cache_dir.mkdir(parents=True, exist_ok=True)
         indexer.save_cache(graph, cache_dir)
 
-        # Detect conventions
         try:
+            step.detail("Detecting conventions...")
             report = detect_conventions(project_root, graph)
             count = store_conventions(report, store)
-            progress.update(
-                task_id,
-                description=f"Initialized ({graph.file_count} files, {count} conventions).",
-            )
+            step.detail(f"{graph.file_count} files, {count} conventions")
         except Exception:
-            progress.update(
-                task_id,
-                description=f"Initialized ({graph.file_count} files).",
-            )
+            step.detail(f"{graph.file_count} files indexed")
+
+        # Auto-configure model routing based on available CLI tools
+        try:
+            step.detail("Configuring models...")
+            from musonius.config.defaults import generate_optimal_models
+
+            optimal = generate_optimal_models()
+            config = load_config(project_root)
+            config["models"] = optimal
+            save_config(project_root, config)
+        except Exception:
+            pass  # Auto-config is non-critical
 
         store.close()
     except Exception as e:
         logger.debug("Init failed: %s", e)
-        progress.update(task_id, description=f"Init warning: {e}")
+        step.detail(f"Warning: {e}")
 
 
-def _run_plan(
+def _run_plan_pipeline(
     project_root: Path,
     task: str,
     max_phases: int,
-    progress: Progress,
-    task_id: object,
-) -> object | None:
-    """Run the plan step. Returns the Plan object or None on failure."""
+    step: _StepHandle,
+) -> Any | None:
+    """Run the plan step with pipeline progress tracking."""
     try:
         from musonius.config.defaults import INDEX_DIR
         from musonius.config.loader import load_config
@@ -178,7 +182,7 @@ def _run_plan(
         memory.initialize()
         router = ModelRouter(config)
 
-        # Load repo map
+        step.detail("Loading repo map...")
         repo_map = ""
         try:
             indexer = Indexer(project_root)
@@ -190,29 +194,28 @@ def _run_plan(
         except Exception as e:
             logger.debug("Failed to load repo map: %s", e)
 
+        step.detail("Calling LLM...")
         engine = PlanningEngine(memory=memory, router=router, project_root=project_root)
-        plan = engine.generate_plan(task, max_phases=max_phases, repo_map=repo_map)
-
-        progress.update(
-            task_id,
-            description=f"Plan generated: {plan.epic_id} ({len(plan.phases)} phases).",
+        plan = engine.generate_plan(
+            task, max_phases=max_phases, repo_map=repo_map, on_status=step.detail,
         )
+
+        step.detail(f"{plan.epic_id} ({len(plan.phases)} phases)")
         memory.close()
         return plan
     except Exception as e:
         logger.debug("Plan generation failed: %s", e)
-        progress.update(task_id, description=f"Plan skipped: {e}")
+        step.detail(f"Skipped: {e}")
         return None
 
 
-def _run_prep(
+def _run_prep_pipeline(
     project_root: Path,
     agent: str,
     output: str | None,
-    progress: Progress,
-    task_id: object,
+    step: _StepHandle,
 ) -> str | None:
-    """Run the prep step. Returns the handoff file path or None on failure."""
+    """Run the prep step with pipeline progress tracking."""
     try:
         from musonius.config.defaults import INDEX_DIR
         from musonius.config.loader import load_config
@@ -225,28 +228,23 @@ def _run_prep(
         memory = MemoryStore(project_root / ".musonius" / "memory" / "decisions.db")
         memory.initialize()
 
-        # Load index data
+        step.detail("Loading index...")
         indexer = Indexer(project_root)
         cache_dir = project_root / ".musonius" / INDEX_DIR
-        cached_graph = indexer.load_cache(cache_dir)
+        indexer.load_cache(cache_dir)
 
         repo_map_gen = RepoMapGenerator(indexer)
 
-        # Generate handoff via ContextEngine
+        step.detail(f"Building {agent} context...")
         engine = ContextEngine(
             project_root=project_root,
             indexer=indexer,
             repo_map_generator=repo_map_gen,
             memory_store=memory,
         )
-
-        result = engine.get_context(
-            task="",  # Task already captured in the plan
-            agent=agent,
-        )
+        result = engine.get_context(task="", agent=agent)
         handoff = result.formatted_output
 
-        # Determine output path
         if output:
             out_path = output
         else:
@@ -254,10 +252,10 @@ def _run_prep(
 
         Path(out_path).write_text(handoff)
         size = len(handoff)
-        progress.update(task_id, description=f"Handoff written ({size:,} chars).")
+        step.detail(f"{size:,} chars → {Path(out_path).name}")
         memory.close()
         return out_path
     except Exception as e:
         logger.debug("Prep failed: %s", e)
-        progress.update(task_id, description=f"Prep warning: {e}")
+        step.detail(f"Warning: {e}")
         return None

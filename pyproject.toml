@@ -32,12 +32,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tui = [
+    "textual>=0.70",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.3",
     "mypy>=1.8",
     "types-PyYAML>=6.0",
     "types-networkx>=3.0",
+    "textual-dev>=1.0",
 ]
 
 [project.scripts]
@@ -86,5 +90,5 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["networkx.*", "yaml.*", "litellm.*", "tree_sitter.*", "tree_sitter_python.*", "fastmcp.*"]
+module = ["networkx.*", "yaml.*", "litellm.*", "tree_sitter.*", "tree_sitter_python.*", "fastmcp.*", "textual.*"]
 ignore_missing_imports = true

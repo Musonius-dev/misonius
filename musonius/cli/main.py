@@ -53,6 +53,7 @@ from musonius.cli.plan import plan_command  # noqa: E402
 from musonius.cli.prep import prep_command  # noqa: E402
 from musonius.cli.review import review_command  # noqa: E402
 from musonius.cli.rollback import rollback_command  # noqa: E402
+from musonius.cli.run import run_command  # noqa: E402
 from musonius.cli.serve import serve_command  # noqa: E402
 from musonius.cli.status import status_command  # noqa: E402
 from musonius.cli.verify import verify_command  # noqa: E402
@@ -62,6 +63,7 @@ app.command(name="doctor")(doctor_command)
 app.command(name="go")(go_command)
 app.command(name="plan")(plan_command)
 app.command(name="prep")(prep_command)
+app.command(name="run")(run_command)
 app.command(name="verify")(verify_command)
 app.command(name="review")(review_command)
 app.command(name="rollback")(rollback_command)

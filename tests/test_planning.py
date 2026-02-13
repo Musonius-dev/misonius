@@ -372,6 +372,61 @@ class TestPlanningEngineExtractJson:
         result = engine._extract_json("This is not JSON at all")
         assert result == {"phases": []}
 
+    def test_json_embedded_in_conversation(self, tmp_path: Path) -> None:
+        """Should extract JSON from conversational Claude CLI response."""
+        engine = PlanningEngine(
+            memory=_make_memory(),
+            router=_make_router({}),
+            project_root=tmp_path,
+        )
+        text = (
+            "Here's the implementation plan for your request:\n\n"
+            '{"phases": [{"id": "phase-1", "title": "Setup"}], '
+            '"architecture_decisions": []}\n\n'
+            "Let me know if you'd like any changes!"
+        )
+        result = engine._extract_json(text)
+        assert "phases" in result
+        assert len(result["phases"]) == 1
+        assert result["phases"][0]["id"] == "phase-1"
+
+    def test_json_with_nested_braces(self, tmp_path: Path) -> None:
+        """Should handle deeply nested JSON objects."""
+        engine = PlanningEngine(
+            memory=_make_memory(),
+            router=_make_router({}),
+            project_root=tmp_path,
+        )
+        plan_json = json.dumps({
+            "phases": [{
+                "id": "phase-1",
+                "title": "Add auth",
+                "files": [{"path": "auth.py", "action": "create", "description": "Auth module"}],
+                "acceptance_criteria": ["Tests pass"],
+            }],
+            "architecture_decisions": [{"summary": "Use JWT", "rationale": "Standard"}],
+        })
+        text = f"Analysis complete.\n{plan_json}\nEnd of plan."
+        result = engine._extract_json(text)
+        assert len(result["phases"]) == 1
+        assert len(result["architecture_decisions"]) == 1
+
+    def test_prefers_plan_json_over_small_objects(self, tmp_path: Path) -> None:
+        """Should prefer the JSON with 'phases' key over smaller JSON objects."""
+        engine = PlanningEngine(
+            memory=_make_memory(),
+            router=_make_router({}),
+            project_root=tmp_path,
+        )
+        text = (
+            'Status: {"ok": true}\n'
+            '{"phases": [{"id": "p1", "title": "Main"}]}\n'
+            'Metadata: {"version": 2}'
+        )
+        result = engine._extract_json(text)
+        assert "phases" in result
+        assert result["phases"][0]["id"] == "p1"
+
 
 class TestPlanningEngineValidation:
     """Tests for PlanningEngine.validate_plan."""

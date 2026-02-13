@@ -110,7 +110,7 @@ def call_claude_cli(
     """
     prompt = _messages_to_prompt(messages)
 
-    cmd = ["claude", "-p", prompt, "--no-input"]
+    cmd = ["claude", "-p", prompt]
 
     if max_tokens:
         cmd.extend(["--max-tokens", str(max_tokens)])

@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING
 
 import typer
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt
 from rich.table import Table
 
+from musonius.cli.display import StreamingDisplay
 from musonius.cli.utils import console, handle_errors, require_initialized
 
 if TYPE_CHECKING:
@@ -67,14 +67,10 @@ def plan_command(
             from musonius.context.repo_map import RepoMapGenerator
             from musonius.planning.engine import PlanningEngine
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as progress:
+            with StreamingDisplay("Generating plan...", transient=False) as display:
                 # Load repo map from index cache
                 repo_map = ""
-                map_task = progress.add_task("Loading repo map...", total=None)
+                display.update("Loading repo map...")
                 try:
                     indexer = Indexer(project_root)
                     cache_dir = project_root / ".musonius" / INDEX_DIR
@@ -82,24 +78,25 @@ def plan_command(
                     if cached_graph:
                         repo_map_gen = RepoMapGenerator(indexer)
                         repo_map = repo_map_gen.generate(level=1, token_budget=4000)
-                        progress.update(
-                            map_task,
-                            description=f"Loaded repo map ({len(repo_map):,} chars).",
-                        )
+                        display.update(f"Loaded repo map ({len(repo_map):,} chars)")
                     else:
-                        progress.update(
-                            map_task,
-                            description="No index cache found, planning without repo map.",
-                        )
+                        display.update("No index cache, planning without repo map")
                 except Exception as e:
                     logger.debug("Failed to load repo map: %s", e)
-                    progress.update(map_task, description="Repo map unavailable.")
+                    display.update("Repo map unavailable")
 
-                # Generate the plan via LLM
-                gen_task = progress.add_task("Generating plan...", total=None)
+                # Generate the plan via LLM — with live status updates
+                display.update("Calling LLM for plan generation...")
                 engine = PlanningEngine(memory=memory, router=router, project_root=project_root)
-                plan = engine.generate_plan(refined_task, max_phases=phases, repo_map=repo_map)
-                progress.update(gen_task, description="Plan generated.")
+                plan = engine.generate_plan(
+                    refined_task,
+                    max_phases=phases,
+                    repo_map=repo_map,
+                    on_status=display.update,
+                )
+                display.complete(
+                    f"Plan generated: {plan.epic_id} ({len(plan.phases)} phases)"
+                )
 
             # Track epic lifecycle
             memory.set_epic_status(plan.epic_id, "planned", task_description=refined_task)
@@ -111,7 +108,7 @@ def plan_command(
             logger.exception("Plan generation failed")
             activity["outcome"] = f"Failed: {e}"
             console.print(f"[red]Plan generation failed:[/red] {e}")
-            console.print("[dim]Tip: Ensure your LLM API keys are configured.[/dim]")
+            console.print("[dim]Tip: Run 'musonius doctor' to check your setup.[/dim]")
 
 
 def _run_clarification(task: str, router: ModelRouter) -> str:
@@ -191,7 +188,22 @@ def _run_clarification(task: str, router: ModelRouter) -> str:
 
 
 def _display_plan(plan: object) -> None:
-    """Display a plan using Rich tables."""
+    """Display a plan using Rich Markdown rendering.
+
+    Uses the enhanced display module for styled terminal markdown
+    with syntax-highlighted tables and acceptance criteria.
+    """
+    try:
+        from musonius.cli.display import render_plan_markdown
+
+        render_plan_markdown(plan)
+    except Exception:
+        # Fallback to basic display if enhanced rendering fails
+        _display_plan_fallback(plan)
+
+
+def _display_plan_fallback(plan: object) -> None:
+    """Fallback plan display using basic Rich tables."""
     from musonius.planning.schemas import Plan
 
     if not isinstance(plan, Plan):

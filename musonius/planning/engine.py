@@ -6,7 +6,7 @@ import json
 import logging
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from musonius.memory.store import MemoryStore
 from musonius.orchestration.router import ModelRouter
@@ -48,6 +48,7 @@ class PlanningEngine:
         task_description: str,
         max_phases: int = 1,
         repo_map: str = "",
+        on_status: Callable[[str], None] | None = None,
     ) -> Plan:
         """Generate an implementation plan for a task.
 
@@ -55,11 +56,17 @@ class PlanningEngine:
             task_description: Description of what to implement.
             max_phases: Maximum number of phases in the plan.
             repo_map: Optional repo map context.
+            on_status: Optional callback for progress updates.
 
         Returns:
             Structured Plan object.
         """
+        def _status(msg: str) -> None:
+            if on_status:
+                on_status(msg)
+
         # Gather context from memory
+        _status("Querying project memory...")
         decisions = self.memory.search_decisions(task_description)
         conventions = self.memory.get_all_conventions()
         failures = self.memory.search_failures(task_description)
@@ -75,6 +82,7 @@ class PlanningEngine:
             for f in failures
         )
 
+        _status("Building plan prompt...")
         messages = build_plan_prompt(
             task_description=task_description,
             repo_map=repo_map,
@@ -84,22 +92,27 @@ class PlanningEngine:
             max_phases=max_phases,
         )
 
-        response = self.router.call_planner(messages)
+        _status("Calling LLM for plan generation...")
+        response = self.router.call_planner(messages, on_status=on_status)
 
+        _status("Parsing plan response...")
         raw_data = self._extract_json(response.content)
         plan = self._parse_plan_response(response.content, task_description)
 
         # Validate plan and log warnings
+        _status("Validating plan...")
         validation_errors = self.validate_plan(plan)
         for error in validation_errors:
             logger.warning("Plan validation: %s", error)
 
         # Extract and store architectural decisions from plan output
+        _status("Storing architectural decisions...")
         self._extract_and_store_decisions(raw_data, plan.epic_id)
 
         # Generate SOT files from decisions
         self._generate_sot_files(raw_data, plan.epic_id)
 
+        _status("Saving plan to disk...")
         self._save_plan(plan)
 
         return plan
@@ -153,7 +166,13 @@ class PlanningEngine:
         )
 
     def _extract_json(self, text: str) -> dict[str, Any]:
-        """Extract JSON from LLM response, handling markdown code blocks.
+        """Extract JSON from LLM response, handling various response formats.
+
+        Handles:
+        - Pure JSON responses
+        - JSON wrapped in markdown code blocks (```json ... ```)
+        - JSON embedded in conversational text (Claude CLI often does this)
+        - Brace-matched extraction as last resort
 
         Args:
             text: Raw response text.
@@ -161,27 +180,67 @@ class PlanningEngine:
         Returns:
             Parsed JSON dictionary.
         """
-        # Try direct parse first
+        # Strategy 1: Try direct parse
         try:
-            parsed: dict[str, Any] = json.loads(text)
+            parsed: dict[str, Any] = json.loads(text.strip())
             return parsed
         except json.JSONDecodeError:
             pass
 
-        # Try extracting from code block
+        # Strategy 2: Extract from markdown code blocks
         if "```" in text:
             blocks = text.split("```")
             for block in blocks:
                 clean = block.strip()
-                if clean.startswith("json"):
-                    clean = clean[4:].strip()
+                for prefix in ("json", "JSON", "javascript", "js"):
+                    if clean.startswith(prefix):
+                        clean = clean[len(prefix):].strip()
+                        break
                 try:
                     parsed = json.loads(clean)
-                    return parsed
+                    if isinstance(parsed, dict):
+                        return parsed
                 except json.JSONDecodeError:
                     continue
 
-        logger.warning("Failed to parse plan JSON, returning empty plan")
+        # Strategy 3: Brace-matched extraction — find JSON objects in text
+        candidates: list[str] = []
+        depth = 0
+        start = -1
+        for i, char in enumerate(text):
+            if char == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append(text[start : i + 1])
+                    start = -1
+
+        # Try candidates from largest to smallest
+        candidates.sort(key=len, reverse=True)
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict) and (
+                    "phases" in parsed or "architecture_decisions" in parsed
+                ):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+        # Try any valid dict candidate
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+        logger.warning("Failed to parse plan JSON from response (%d chars)", len(text))
+        logger.debug("Response preview: %.500s", text[:500])
         return {"phases": []}
 
     def _save_plan(self, plan: Plan) -> None:

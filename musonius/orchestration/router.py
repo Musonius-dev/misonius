@@ -12,7 +12,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import litellm
 
@@ -212,6 +212,7 @@ class ModelRouter:
         max_tokens: int | None = None,
         retries: int = 2,
         fallback_model: str | None = None,
+        on_status: Callable[[str], None] | None = None,
         **kwargs: Any,
     ) -> ModelResponse:
         """Call an LLM with automatic backend selection.
@@ -228,6 +229,7 @@ class ModelRouter:
             max_tokens: Maximum response tokens.
             retries: Number of retry attempts.
             fallback_model: Fallback model if primary fails.
+            on_status: Optional callback for progress status updates.
             **kwargs: Additional parameters passed to litellm.completion.
 
         Returns:
@@ -238,13 +240,19 @@ class ModelRouter:
         """
         last_error: Exception | None = None
 
+        def _status(msg: str) -> None:
+            if on_status:
+                on_status(msg)
+
         # Strategy 1: Try LiteLLM if we have an API key
         if self._has_api_key(model):
+            _status(f"Calling {model} via API...")
             for attempt in range(retries + 1):
                 try:
                     return self._make_litellm_call(model, messages, temperature, max_tokens, **kwargs)
                 except Exception as e:
                     last_error = e
+                    _status(f"API attempt {attempt + 1}/{retries + 1} failed")
                     logger.warning(
                         "LiteLLM call failed (attempt %d/%d) for %s: %s",
                         attempt + 1,
@@ -255,24 +263,29 @@ class ModelRouter:
                     if attempt < retries:
                         base_delay = 2**attempt
                         jitter = random.uniform(0, base_delay * 0.5)
+                        _status(f"Retrying in {base_delay:.0f}s...")
                         time.sleep(base_delay + jitter)
 
         # Strategy 2: Try CLI backend
         cli_tool = self._get_cli_tool_for_model(model)
         if cli_tool:
+            _status(f"Routing to {cli_tool} CLI...")
             try:
                 return self._make_cli_call(cli_tool, model, messages, max_tokens)
             except Exception as e:
                 last_error = e
+                _status(f"{cli_tool} CLI failed: {e}")
                 logger.warning("CLI call failed for %s via %s: %s", model, cli_tool, e)
 
         # Strategy 3: Try fallback model (recurse with fallback)
         if fallback_model and fallback_model != model:
+            _status(f"Falling back to {fallback_model}...")
             logger.info("Falling back from %s to %s", model, fallback_model)
             try:
                 return self.call(
                     fallback_model, messages, temperature, max_tokens,
-                    retries=retries, fallback_model=None, **kwargs,
+                    retries=retries, fallback_model=None, on_status=on_status,
+                    **kwargs,
                 )
             except Exception as e:
                 logger.error("Fallback model %s also failed: %s", fallback_model, e)
@@ -330,6 +343,8 @@ class ModelRouter:
     ) -> ModelResponse:
         """Call the verifier model (cross-model review).
 
+        Falls back to scout model if verifier is unavailable.
+
         Args:
             messages: Chat messages.
             **kwargs: Additional parameters.
@@ -338,7 +353,8 @@ class ModelRouter:
             ModelResponse from the verifier model.
         """
         model = self.get_model("verifier")
-        return self.call(model, messages, **kwargs)
+        fallback = self.get_model("scout")
+        return self.call(model, messages, fallback_model=fallback, **kwargs)
 
     def _make_cli_call(
         self,
