@@ -14,3 +14,10 @@ enabled = true
 [[analyzers]]
 name = "secrets"
 enabled = true
+
+[[analyzers]]
+name = "sca"
+enabled = true
+
+[code_coverage]
+enabled = true
